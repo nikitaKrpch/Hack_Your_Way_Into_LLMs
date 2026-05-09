@@ -6,13 +6,27 @@ from typing import Any
 import numpy as np
 import torch
 
-# ---------------------------------------------------------------------------
-# Paths  — predict.py lives at  tools/claude-code-aiaas/predict.py
-#           _ROOT  = tools/.. = the mechhack repo root
-# ---------------------------------------------------------------------------
-_ROOT      = Path(__file__).resolve().parent.parent.parent   # .../mechhack
-_DATA      = _ROOT / "datasets"
-_EXTRACTS  = _ROOT / "extracts"                              # extract_residuals.py output
+
+
+
+def find_repo_root(start: Path) -> Path:
+    current = start.resolve()
+
+    while current != current.parent:
+        if (current / "datasets").exists() and (current / "extracts").exists():
+            return current
+        current = current.parent
+
+    raise RuntimeError("Could not locate repo root")
+
+
+
+_ROOT = find_repo_root(Path(__file__))
+_DATA = _ROOT / "datasets"
+_EXTRACTS = _ROOT / "extracts"
+
+
+
 
 
 # ---------------------------------------------------------------------------
