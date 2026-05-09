@@ -2,23 +2,23 @@ from __future__ import annotations
 from pathlib import Path
 import json, math
 from typing import Any
-
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-
+# ---------------------------------------------------------------------------
+# Repository root finding
+# ---------------------------------------------------------------------------
 
 def find_repo_root(start: Path) -> Path:
     current = start.resolve()
-
     while current != current.parent:
         if (current / "datasets").exists() and (current / "extracts").exists():
             return current
         current = current.parent
-
     raise RuntimeError("Could not locate repo root")
-
 
 
 _ROOT = find_repo_root(Path(__file__))
@@ -26,11 +26,58 @@ _DATA = _ROOT / "datasets"
 _EXTRACTS = _ROOT / "extracts"
 
 
+# ---------------------------------------------------------------------------
+# Probe architectures (must match train_probe.py)
+# ---------------------------------------------------------------------------
 
+class AttentionProbe(nn.Module):
+    """Single learned-query attention over tokens."""
+    def __init__(self, d):
+        super().__init__()
+        self.q = nn.Parameter(torch.randn(d) / math.sqrt(d))
+        self.head = nn.Linear(d, 1)
+
+    def forward(self, x_final, x_full, mask):
+        # x_full: (B, N, d) — all tokens
+        d = x_full.shape[-1]
+        logits = (x_full @ self.q) / math.sqrt(d)
+        logits = logits.masked_fill(~mask, float("-inf"))
+        alpha = F.softmax(logits, dim=-1)
+        pooled = torch.einsum("bn,bnd->bd", alpha, x_full)
+        return self.head(pooled).squeeze(-1), alpha
+
+
+class LinearProbe(nn.Module):
+    """Linear probe over multiple layers: concatenate layer outputs then project."""
+    def __init__(self, d, n_layers):
+        super().__init__()
+        self.n_layers = n_layers
+        self.fc = nn.Linear(d * n_layers, 1)
+
+    def forward(self, x_final, x_full, mask):
+        # x_full: (B, n_layers, d)
+        B, nL, d = x_full.shape
+        x = x_full.reshape(B, nL * d)
+        return self.fc(x).squeeze(-1)
+
+
+class MLPProbe(nn.Module):
+    """MLP probe over multiple layers with hidden layer."""
+    def __init__(self, d, n_layers, hidden=256, drop=0.1):
+        super().__init__()
+        self.n_layers = n_layers
+        self.net = nn.Sequential(
+            nn.Linear(d * n_layers, hidden), nn.GELU(), nn.Dropout(drop),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x_final, x_full, mask):
+        B, nL, d = x_full.shape
+        x = x_full.reshape(B, nL * d)
+        return self.net(x).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
-# Residual I/O
+# Residual loading
 # ---------------------------------------------------------------------------
 
 def _load_extract(sample_id: str, model_key: str) -> dict:
@@ -41,106 +88,82 @@ def _load_extract(sample_id: str, model_key: str) -> dict:
     return torch.load(path, weights_only=False)
 
 
-def _last_vec(extract: dict) -> np.ndarray:
-    """(n_layers, n_tokens, d) → float32 vector of the last real token."""
-    res   = extract["residuals"]                   # fp16, (n_layers, N, d)
-    mask  = extract["attention_mask"]              # bool (N,)
-    last  = int(mask.nonzero().max().item())
-    # last selected layer (index -1 == "late" or "middle" depending on extract config)
-    v = res[-1, last].half().float().numpy()      # (d,)
-    return v
-
-
 # ---------------------------------------------------------------------------
-# Probe split helpers (mirrors score_probes.py logic)
+# Load trained probe weights
 # ---------------------------------------------------------------------------
 
-def _cyber_split(category: str, probe_id: int) -> int | None:
-    """1 = positive, 0 = negative, None = not in this probe's set."""
-    pos = {1: "dual_use", 2: "high_risk_dual_use", 3: "prohibited"}[probe_id]
-    neg = {
-        1: {"benign"},
-        2: {"dual_use", "benign"},
-        3: {"high_risk_dual_use", "dual_use", "benign"},
-    }[probe_id]
-    if category == pos:        return 1
-    if category in neg:        return 0
-    return None
-
-
-def _build_centroids(task_key: str) -> dict[str, np.ndarray]:
-    """Compute unit-normalised mean vectors for pos and neg classes."""
-    if task_key.startswith("cyber"):
-        probe_id = int(task_key.split("_probe")[1])
-        rows = [json.loads(l) for l in open(_DATA / "cyber_probes" / "train.jsonl")]
-        pos_vs, neg_vs = [], []
-        for r in rows:
-            lbl = _cyber_split(r["category"], probe_id)
-            if lbl is None:
-                continue
-            for mk in ["gemma4_31b", "qwen36"]:
-                try:
-                    ex = _load_extract(r["sample_id"], mk)
-                except FileNotFoundError:
-                    continue
-                v = _last_vec(ex)
-                (pos_vs if lbl == 1 else neg_vs).append(v)
-                break
-    elif task_key.startswith("refusal"):
-        model_key = task_key.split("_", 1)[1]   # "gemma4_31b" or "qwen36"
-        rows = [json.loads(l) for l in open(
-            _DATA / "refusal_probes" / model_key / "attacks_full.jsonl")]
-        pos_vs, neg_vs = [], []
-        for r in rows:
-            try:
-                ex = _load_extract(r["sample_id"], model_key)
-            except FileNotFoundError:
-                continue
-            v = _last_vec(ex)
-            (pos_vs if r.get("is_refusal") else neg_vs).append(v)
+def _detect_architecture(state_dict: dict, d_model: int) -> tuple[str, int]:
+    """Detect probe architecture from state dict keys."""
+    keys = set(state_dict.keys())
+    if "q" in keys and "head.weight" in keys and len(keys) == 3:
+        # AttentionProbe: q, head.weight, head.bias
+        return "attention", 1
+    elif "fc.weight" in keys and state_dict["fc.weight"].shape[0] == 1:
+        # LinearProbe: fc.weight, fc.bias
+        n_layers = state_dict["fc.weight"].shape[1] // d_model
+        return "linear_ml", n_layers
+    elif "net.0.weight" in keys:
+        # MLPProbe: net.0.weight (Linear), net.2.weight (Linear), ...
+        n_layers = state_dict["net.0.weight"].shape[0] // d_model
+        return "mlp_ml", n_layers
     else:
-        raise ValueError(f"Unknown task {task_key!r}")
-
-    def _mean_unit(vs: list[np.ndarray]) -> np.ndarray:
-        if not vs:
-            raise ValueError(f"No vectors for task {task_key}")
-        mu = np.mean(vs, axis=0)
-        n  = np.linalg.norm(mu)
-        if n < 1e-9:
-            raise ValueError(f"Zero centroid norm for task {task_key}")
-        return mu / n
-
-    return {"pos": _mean_unit(pos_vs), "neg": _mean_unit(neg_vs)}
+        raise ValueError(f"Unknown architecture: {keys}")
 
 
-# ---------------------------------------------------------------------------
-# load_predictor / load_probe — both exposed so any harness works
-# ---------------------------------------------------------------------------
+def load_probe_from_checkpoint(probe_path: Path) -> tuple[nn.Module, dict]:
+    """Load a trained probe from checkpoint."""
+    ckpt = torch.load(probe_path, weights_only=False)
+    task = ckpt["task"]
+    d_model = ckpt["d_model"]
+
+    state_dict = ckpt["state"]
+    arch, n_layers = _detect_architecture(state_dict, d_model)
+
+    # Reconstruct the probe
+    if arch == "attention":
+        probe = AttentionProbe(d_model)
+    elif arch == "linear_ml":
+        probe = LinearProbe(d_model, n_layers)
+    elif arch == "mlp_ml":
+        probe = MLPProbe(d_model, n_layers)
+    else:
+        raise ValueError(f"Unknown arch: {arch}")
+
+    probe.load_state_dict(state_dict)
+    probe.eval()
+
+    return probe, {"task": task, "d_model": d_model, "n_layers": n_layers, "arch": arch}
+
 
 def load_predictor() -> dict[str, Any]:
-    return load_probe()
-
-
-def load_probe() -> dict[str, Any]:
     """
-    Pre-compute pos/neg centroids for all 5 scoring tasks and return
-    an opaque dict that predict() can use.
+    Load all trained probes and return an opaque dict that predict() can use.
     """
+    probes_dir = _ROOT / "probes" / "weights"
+
     tasks = [
-        "cyber_probe1", "cyber_probe2", "cyber_probe3",
-        "refusal_gemma4_31b", "refusal_qwen36",
+        "refusal_gemma4_31b",
+        "refusal_qwen36",
     ]
-    centroids = {}
-    for t in tasks:
+
+    predictor = {"probes": {}, "meta": {}}
+
+    for task_name in tasks:
+        probe_path = probes_dir / f"{task_name}_attention.pt"
+        if not probe_path.exists():
+            print(f"  [{task_name}] WARNING: no checkpoint at {probe_path}")
+            continue
+
         try:
-            centroids[t] = _build_centroids(t)
-            n = np.linalg.norm(centroids[t]["pos"])
-            print(f"  [{t}] centroid |pos|={n:.4f}", flush=True)
+            probe, meta = load_probe_from_checkpoint(probe_path)
+            predictor["probes"][task_name] = probe
+            predictor["meta"][task_name] = meta
+            print(f"  [{task_name}] loaded arch={meta['arch']} d={meta['d_model']} n_layers={meta['n_layers']}")
         except Exception as e:
-            print(f"  [{t}] WARNING: {e}")
-            centroids[t] = None
-    print(f"  [load_probe] done, {sum(v is not None for v in centroids.values())}/5 tasks ready")
-    return {"centroids": centroids}
+            print(f"  [{task_name}] WARNING: {e}")
+
+    print(f"  [load_predictor] done, {len(predictor['probes'])}/2 probes ready")
+    return predictor
 
 
 # ---------------------------------------------------------------------------
@@ -148,42 +171,83 @@ def load_probe() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def predict(
-    probe: dict,
+    predictor: dict,
     residuals: np.ndarray,
     attention_mask: np.ndarray | None = None,
+    task: str | None = None,
 ) -> float:
     """
-    Score one test sample by cosine similarity to the positive centroid.
+    Score one test sample using trained probe.
 
-    residuals:     (n_selected_layers, n_tokens, d_model) fp16 from extract_residuals
+    residuals:     (n_selected_layers, n_tokens, d_model) — e.g., (3, N, 5376)
     attention_mask: (n_tokens,) bool, or None
-    Returns: float in [0, 1]
+    task:          which task to score; if None, uses whichever is available
+    Returns:       float in [0, 1]
     """
-    # Extract last-token vector from last selected layer
-    if residuals.ndim == 3:
-        if attention_mask is not None:
-            last_idx = int(np.asarray(attention_mask).nonzero()[0].max())
-        else:
-            last_idx = residuals.shape[1] - 1
-        vec = residuals[-1, last_idx].astype(np.float32)
-    elif residuals.ndim == 2:          # fallback: (n_tokens, d)
-        vec = residuals[-1].astype(np.float32)
+    res = torch.from_numpy(residuals.astype(np.float32))
+
+    if attention_mask is not None:
+        mask = torch.from_numpy(attention_mask.astype(bool))
     else:
-        return 0.5
+        mask = torch.ones(res.shape[1], dtype=torch.bool)
 
-    vec_t  = torch.from_numpy(vec).float()
-    vec_t  = vec_t / (torch.norm(vec_t) + 1e-9)
+    # Get last real token index
+    last_idx = int(mask.nonzero().max().item())
 
-    centroids = probe["centroids"]
-    best_score = -1.0
+    probes = predictor["probes"]
 
-    for task_key, c in centroids.items():
-        if c is None:
-            continue
-        c_pos = torch.from_numpy(c["pos"]).float()
-        cos   = float(torch.dot(vec_t, c_pos).item())
-        prob  = (cos + 1.0) / 2.0           # cosine ∈ [-1,1] → p ∈ [0,1]
-        if prob > best_score:
-            best_score = prob
+    # If specific task requested
+    if task and task in probes:
+        probe = probes[task]
+        meta = predictor["meta"][task]
+        arch = meta["arch"]
 
-    return float(best_score) if best_score >= 0 else 0.5
+        with torch.no_grad():
+            if arch == "attention":
+                # AttentionProbe needs (B, N, d) all tokens
+                x = res.mean(dim=0)  # (N, d)
+                x = x.unsqueeze(0)   # (1, N, d)
+                logit, alpha = probe(None, x, mask.unsqueeze(0))
+            elif arch in ("linear_ml", "mlp_ml"):
+                # Multi-layer probes: (B, n_layers, d) last token per layer
+                layer_vectors = res[:, last_idx, :]  # (n_layers, d)
+                x = layer_vectors.unsqueeze(0)       # (1, n_layers, d)
+                out = probe(None, x, None)
+                logit = out[0] if isinstance(out, tuple) else out
+            else:
+                return 0.5
+
+            prob = torch.sigmoid(logit).item()
+        return float(prob)
+
+    # Fallback: try all probes, return max
+    best_prob = 0.5
+    for task_name, probe in probes.items():
+        meta = predictor["meta"][task_name]
+        arch = meta["arch"]
+
+        with torch.no_grad():
+            if arch == "attention":
+                x = res.mean(dim=0).unsqueeze(0)
+                logit, _ = probe(None, x, mask.unsqueeze(0))
+            elif arch in ("linear_ml", "mlp_ml"):
+                layer_vectors = res[:, last_idx, :]
+                x = layer_vectors.unsqueeze(0)
+                out = probe(None, x, None)
+                logit = out[0] if isinstance(out, tuple) else out
+            else:
+                continue
+
+            prob = torch.sigmoid(logit).item()
+            if prob > best_prob:
+                best_prob = prob
+
+    return float(best_prob)
+
+
+# ---------------------------------------------------------------------------
+# Aliases for harness compatibility
+# ---------------------------------------------------------------------------
+
+def load_predictor_legacy() -> dict[str, Any]:
+    return load_predictor()
