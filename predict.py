@@ -76,6 +76,27 @@ class MLPProbe(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+class LayerAttentionProbe(nn.Module):
+    """Attention over layers to produce a weighted combination."""
+    def __init__(self, d, n_layers):
+        super().__init__()
+        self.n_layers = n_layers
+        self.q = nn.Parameter(torch.randn(d) / math.sqrt(d))
+        self.head = nn.Linear(d, 1)
+        self.scale = nn.Parameter(torch.ones(n_layers))
+        self.shift = nn.Parameter(torch.zeros(n_layers))
+
+    def forward(self, x_final, x_full, mask):
+        # x_full: (B, n_layers, N, d)
+        _, nL, _, d = x_full.shape
+        last_per_layer = x_full[:, :, -1, :]  # (B, n_layers, d)
+        last_per_layer = last_per_layer * self.scale.view(1, nL, 1) + self.shift.view(1, nL, 1)
+        logits = (last_per_layer @ self.q) / math.sqrt(d)
+        alpha = F.softmax(logits, dim=1)
+        weighted = torch.einsum("bl,bld->bd", alpha, last_per_layer)
+        return self.head(weighted).squeeze(-1), alpha
+
+
 # ---------------------------------------------------------------------------
 # Residual loading
 # ---------------------------------------------------------------------------
@@ -92,39 +113,26 @@ def _load_extract(sample_id: str, model_key: str) -> dict:
 # Load trained probe weights
 # ---------------------------------------------------------------------------
 
-def _detect_architecture(state_dict: dict, d_model: int) -> tuple[str, int]:
-    """Detect probe architecture from state dict keys."""
-    keys = set(state_dict.keys())
-    if "q" in keys and "head.weight" in keys and len(keys) == 3:
-        # AttentionProbe: q, head.weight, head.bias
-        return "attention", 1
-    elif "fc.weight" in keys and state_dict["fc.weight"].shape[0] == 1:
-        # LinearProbe: fc.weight, fc.bias
-        n_layers = state_dict["fc.weight"].shape[1] // d_model
-        return "linear_ml", n_layers
-    elif "net.0.weight" in keys:
-        # MLPProbe: net.0.weight (Linear), net.2.weight (Linear), ...
-        n_layers = state_dict["net.0.weight"].shape[0] // d_model
-        return "mlp_ml", n_layers
-    else:
-        raise ValueError(f"Unknown architecture: {keys}")
-
 
 def load_probe_from_checkpoint(probe_path: Path) -> tuple[nn.Module, dict]:
     """Load a trained probe from checkpoint."""
     ckpt = torch.load(probe_path, weights_only=False)
-    task = ckpt["task"]
+    task    = ckpt["task"]
     d_model = ckpt["d_model"]
-
+    arch    = ckpt.get("arch", "attention")  # fallback for old checkpoints without arch key
     state_dict = ckpt["state"]
-    arch, n_layers = _detect_architecture(state_dict, d_model)
 
-    # Reconstruct the probe
     if arch == "attention":
+        n_layers = 1
         probe = AttentionProbe(d_model)
+    elif arch == "layer_attn":
+        n_layers = ckpt.get("n_layers_extracted", state_dict["scale"].shape[0])
+        probe = LayerAttentionProbe(d_model, n_layers)
     elif arch == "linear_ml":
+        n_layers = state_dict["fc.weight"].shape[1] // d_model
         probe = LinearProbe(d_model, n_layers)
     elif arch == "mlp_ml":
+        n_layers = state_dict["net.0.weight"].shape[0] // d_model
         probe = MLPProbe(d_model, n_layers)
     else:
         raise ValueError(f"Unknown arch: {arch}")
@@ -136,22 +144,27 @@ def load_probe_from_checkpoint(probe_path: Path) -> tuple[nn.Module, dict]:
 
 
 def load_predictor() -> dict[str, Any]:
-    """
-    Load all trained probes and return an opaque dict that predict() can use.
-    """
+    """Load all trained probes and return an opaque dict that predict() can use."""
     probes_dir = _ROOT / "probes" / "weights"
 
     tasks = [
         "refusal_gemma4_31b",
         "refusal_qwen36",
+        "cyber_prohib_vs_rest_gemma4_31b",
+        "cyber_hdu_vs_rest_gemma4_31b",
+        "cyber_du_vs_rest_gemma4_31b",
     ]
 
     predictor = {"probes": {}, "meta": {}}
 
     for task_name in tasks:
-        probe_path = probes_dir / f"{task_name}_attention.pt"
+        # prefer layer_attn weights when available (higher AUC), fall back to attention
+        layer_attn_path = probes_dir / f"{task_name}_layer_attn.pt"
+        attn_path       = probes_dir / f"{task_name}_attention.pt"
+        probe_path = layer_attn_path if layer_attn_path.exists() else attn_path
+
         if not probe_path.exists():
-            print(f"  [{task_name}] WARNING: no checkpoint at {probe_path}")
+            print(f"  [{task_name}] WARNING: no checkpoint found")
             continue
 
         try:
@@ -162,13 +175,30 @@ def load_predictor() -> dict[str, Any]:
         except Exception as e:
             print(f"  [{task_name}] WARNING: {e}")
 
-    print(f"  [load_predictor] done, {len(predictor['probes'])}/2 probes ready")
+    print(f"  [load_predictor] done, {len(predictor['probes'])}/5 probes ready")
     return predictor
 
 
 # ---------------------------------------------------------------------------
 # predict
 # ---------------------------------------------------------------------------
+
+def _run_probe(probe, arch: str, res: torch.Tensor, last_idx: int, mask: torch.Tensor):
+    """Run one probe forward pass and return the raw logit, or None on unknown arch."""
+    if arch == "attention":
+        x = res.mean(dim=0).unsqueeze(0)          # (1, N, d)
+        logit, _ = probe(None, x, mask.unsqueeze(0))
+    elif arch == "layer_attn":
+        x = res.unsqueeze(0)                       # (1, n_layers, N, d)
+        logit, _ = probe(None, x, None)
+    elif arch in ("linear_ml", "mlp_ml"):
+        x = res[:, last_idx, :].unsqueeze(0)       # (1, n_layers, d)
+        out = probe(None, x, None)
+        logit = out[0] if isinstance(out, tuple) else out
+    else:
+        return None
+    return logit
+
 
 def predict(
     predictor: dict,
@@ -203,46 +233,25 @@ def predict(
         arch = meta["arch"]
 
         with torch.no_grad():
-            if arch == "attention":
-                # AttentionProbe needs (B, N, d) all tokens
-                x = res.mean(dim=0)  # (N, d)
-                x = x.unsqueeze(0)   # (1, N, d)
-                logit, alpha = probe(None, x, mask.unsqueeze(0))
-            elif arch in ("linear_ml", "mlp_ml"):
-                # Multi-layer probes: (B, n_layers, d) last token per layer
-                layer_vectors = res[:, last_idx, :]  # (n_layers, d)
-                x = layer_vectors.unsqueeze(0)       # (1, n_layers, d)
-                out = probe(None, x, None)
-                logit = out[0] if isinstance(out, tuple) else out
-            else:
+            logit = _run_probe(probe, arch, res, last_idx, mask)
+            if logit is None:
                 return 0.5
-
             prob = torch.sigmoid(logit).item()
         return float(prob)
 
-    # Fallback: try all probes, return max
-    best_prob = 0.5
+    # Fallback: pick the probe whose d_model matches the residuals
+    d_model = res.shape[-1]
     for task_name, probe in probes.items():
         meta = predictor["meta"][task_name]
-        arch = meta["arch"]
-
+        if meta["d_model"] != d_model:
+            continue
         with torch.no_grad():
-            if arch == "attention":
-                x = res.mean(dim=0).unsqueeze(0)
-                logit, _ = probe(None, x, mask.unsqueeze(0))
-            elif arch in ("linear_ml", "mlp_ml"):
-                layer_vectors = res[:, last_idx, :]
-                x = layer_vectors.unsqueeze(0)
-                out = probe(None, x, None)
-                logit = out[0] if isinstance(out, tuple) else out
-            else:
+            logit = _run_probe(probe, meta["arch"], res, last_idx, mask)
+            if logit is None:
                 continue
+            return float(torch.sigmoid(logit).item())
 
-            prob = torch.sigmoid(logit).item()
-            if prob > best_prob:
-                best_prob = prob
-
-    return float(best_prob)
+    return 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -250,4 +259,7 @@ def predict(
 # ---------------------------------------------------------------------------
 
 def load_predictor_legacy() -> dict[str, Any]:
+    return load_predictor()
+
+def load_probe() -> dict[str, Any]:
     return load_predictor()
