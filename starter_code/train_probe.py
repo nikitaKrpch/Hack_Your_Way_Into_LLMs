@@ -1,6 +1,9 @@
 """Probe training: linear / MLP / single- and 4-head attention probes.
 5 seeds per arch, two regimes (batch / incremental), saves probe weights.
 
+Multi-layer features: probes can use multiple residual layers via concatenation,
+mean/max pooling, or learned layer-wise attention.
+
 Usage:
     python train_probe.py \
         --extracts_dir ./extracts/gemma4_31b \
@@ -21,7 +24,8 @@ import torch.nn.functional as F
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float32
 SEEDS = [0, 1, 2, 3, 4]
-ARCHS = ["linear", "mlp", "attention", "attention_4h"]
+ARCHS = ["linear", "mlp", "attention", "attention_4h",
+        "linear_ml", "mlp_ml", "layer_attn"]  # multi-layer variants
 REGIMES = ["batch", "incremental"]
 
 
@@ -75,11 +79,62 @@ class MultiHeadAttentionProbe(nn.Module):
         return self.head(pooled).squeeze(-1), alpha
 
 
-def make_probe(arch, d):
+class LinearMultiLayerProbe(nn.Module):
+    """Linear probe over multiple layers: concatenate layer outputs then project."""
+    def __init__(self, d, n_layers):
+        super().__init__()
+        self.n_layers = n_layers
+        self.fc = nn.Linear(d * n_layers, 1)
+    def forward(self, x_final, x_full, mask):
+        # x_full expected to be (B, n_layers, N, d)
+        B, nL, N, d = x_full.shape
+        x = x_full.reshape(B, nL * d)
+        return self.fc(x).squeeze(-1)
+
+
+class MLPMultiLayerProbe(nn.Module):
+    """MLP probe over multiple layers with hidden layer."""
+    def __init__(self, d, n_layers, hidden=256, drop=0.1):
+        super().__init__()
+        self.n_layers = n_layers
+        self.net = nn.Sequential(
+            nn.Linear(d * n_layers, hidden), nn.GELU(), nn.Dropout(drop),
+            nn.Linear(hidden, 1))
+    def forward(self, x_final, x_full, mask):
+        B, nL, N, d = x_full.shape
+        x = x_full.reshape(B, nL * d)
+        return self.net(x).squeeze(-1)
+
+
+class LayerAttentionProbe(nn.Module):
+    """Attention over layers to produce weighted combination."""
+    def __init__(self, d, n_layers):
+        super().__init__()
+        self.n_layers = n_layers
+        self.q = nn.Parameter(torch.randn(d) / math.sqrt(d))
+        self.head = nn.Linear(d, 1)
+        self.scale = nn.Parameter(torch.ones(n_layers))
+        self.shift = nn.Parameter(torch.zeros(n_layers))
+
+    def forward(self, x_final, x_full, mask):
+        # x_full: (B, n_layers, N, d) - last token per layer
+        B, nL, N, d = x_full.shape
+        last_per_layer = x_full[:, :, -1, :]  # (B, n_layers, d)
+        last_per_layer = last_per_layer * self.scale.view(1, nL, 1) + self.shift.view(1, nL, 1)
+        logits = (last_per_layer @ self.q) / math.sqrt(d)
+        alpha = F.softmax(logits, dim=1)
+        weighted = torch.einsum("bl,bld->bd", alpha, last_per_layer)
+        return self.head(weighted).squeeze(-1), alpha
+
+
+def make_probe(arch, d, n_layers=1):
     if arch == "linear":      return LinearProbe(d)
     if arch == "mlp":         return MLPProbe(d)
     if arch == "attention":   return AttentionProbe(d)
     if arch == "attention_4h":return MultiHeadAttentionProbe(d, n_heads=4)
+    if arch == "linear_ml":   return LinearMultiLayerProbe(d, n_layers)
+    if arch == "mlp_ml":      return MLPMultiLayerProbe(d, n_layers)
+    if arch == "layer_attn":  return LayerAttentionProbe(d, n_layers)
     raise ValueError(arch)
 
 
@@ -107,6 +162,7 @@ def get_full_tokens(ex):
 
 def build_dataset(samples, label_fn, extracts_dir):
     x_final, x_full_list, mask_list, y, ids = [], [], [], [], []
+    x_multi_layer_list = []  # Store all layers for multi-layer probes
     skipped = 0
     for s in samples:
         try:
@@ -123,12 +179,19 @@ def build_dataset(samples, label_fn, extracts_dir):
         mask_list.append(m)
         y.append(label_fn(s))
         ids.append(s["sample_id"])
+        # Store all layers for multi-layer probes
+        if full.dim() == 3 and full.shape[0] > 1:
+            x_multi_layer_list.append(full)
+        else:
+            # Single layer - expand to match expected format
+            x_multi_layer_list.append(full.unsqueeze(0))
     if skipped: print(f"    [warn] skipped {skipped}")
     if not x_final: return None
     return {
         "x_final": torch.stack(x_final, dim=0).to(DEVICE),
         "x_full_list": x_full_list,
         "mask_list": mask_list,
+        "x_multi_layer_list": x_multi_layer_list,
         "y": torch.tensor(y, dtype=torch.float32, device=DEVICE),
         "ids": ids,
     }
@@ -147,10 +210,24 @@ def pad_full(x_full_list, mask_list):
     return px, pm
 
 
+def pad_multi_layer(x_multi_layer_list):
+    """Pad multi-layer residuals to same (n_layers, N, d)."""
+    N = len(x_multi_layer_list)
+    nL = x_multi_layer_list[0].shape[0]
+    T_max = max(t.shape[1] for t in x_multi_layer_list)
+    d = x_multi_layer_list[0].shape[2]
+    px = torch.zeros(N, nL, T_max, d, dtype=DTYPE, device=DEVICE)
+    for i, t in enumerate(x_multi_layer_list):
+        T_i = t.shape[1]
+        px[i, :, :T_i, :] = t.to(DEVICE)
+    return px
+
+
 # ---------------- training ----------------
 def train(arch, regime, ds, train_idx, test_idx, seed, d):
     torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
-    model = make_probe(arch, d).to(DEVICE).to(DTYPE)
+    n_layers = ds["x_multi_layer_list"][0].shape[0] if "x_multi_layer_list" in ds else 1
+    model = make_probe(arch, d, n_layers).to(DEVICE).to(DTYPE)
     bce = nn.BCEWithLogitsLoss()
     lr = 5e-4 if "attention" in arch else 1e-3
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
@@ -168,9 +245,13 @@ def train(arch, regime, ds, train_idx, test_idx, seed, d):
                 yb = ds["y"][bi]
                 if arch in ("linear", "mlp"):
                     logits = model(ds["x_final"][bi])
+                elif arch in ("linear_ml", "mlp_ml", "layer_attn"):
+                    px = pad_multi_layer([ds["x_multi_layer_list"][i] for i in bi])
+                    out = model(None, px, None)
+                    logits = out[0] if isinstance(out, tuple) else out
                 else:
                     px, pm = pad_full([ds["x_full_list"][i] for i in bi],
-                                       [ds["mask_list"][i] for i in bi])
+                                        [ds["mask_list"][i] for i in bi])
                     out = model(None, px, pm)
                     logits = out[0] if isinstance(out, tuple) else out
                 loss = bce(logits, yb)
@@ -189,6 +270,10 @@ def train(arch, regime, ds, train_idx, test_idx, seed, d):
             yb = ds["y"][idx:idx+1]
             if arch in ("linear", "mlp"):
                 logits = model(ds["x_final"][idx:idx+1])
+            elif arch in ("linear_ml", "mlp_ml", "layer_attn"):
+                px = pad_multi_layer([ds["x_multi_layer_list"][idx]])
+                out = model(None, px, None)
+                logits = out[0] if isinstance(out, tuple) else out
             else:
                 px, pm = pad_full([ds["x_full_list"][idx]], [ds["mask_list"][idx]])
                 out = model(None, px, pm)
@@ -206,6 +291,10 @@ def evaluate(model, arch, ds, idx):
     with torch.no_grad():
         if arch in ("linear", "mlp"):
             logits = model(ds["x_final"][idx])
+        elif arch in ("linear_ml", "mlp_ml", "layer_attn"):
+            px = pad_multi_layer([ds["x_multi_layer_list"][i] for i in idx])
+            out = model(None, px, None)
+            logits = out[0] if isinstance(out, tuple) else out
         else:
             px, pm = pad_full([ds["x_full_list"][i] for i in idx], [ds["mask_list"][i] for i in idx])
             out = model(None, px, pm)
@@ -242,14 +331,14 @@ def task_specs(manifest):
                 neg += rng.sample(pool, min(n_per, len(pool)))
             samples = pos + neg
             short = {"prohibited": "prohib", "high_risk_dual_use": "hdu",
-                     "dual_use": "du", "benign": "ben"}[cls]
+                    "dual_use": "du", "benign": "ben"}[cls]
             yield (f"cyber_{short}_vs_rest_{model_key}", model_key, samples,
-                   (lambda s, _cls=cls: 1.0 if s["label"] == _cls else 0.0))
+                    (lambda s, _cls=cls: 1.0 if s["label"] == _cls else 0.0))
 
 
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,
-                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--extracts_dir", required=True,
                     help="Directory of per-sample .pt extracts produced by extract_residuals.py")
     ap.add_argument("--manifest", required=True,
@@ -302,9 +391,9 @@ def main():
                     metrics, model = train(arch, reg, ds, train_idx, test_idx, seed, d)
                     elapsed = time.time() - t0
                     rec = {"task": task_name, "model_key": model_key, "arch": arch,
-                           "regime": reg, "seed": seed, "elapsed_s": round(elapsed, 2),
-                           "N_train": int(len(train_idx)), "N_test": int(len(test_idx)),
-                           "extracts": extracts_dir.name, **metrics}
+                            "regime": reg, "seed": seed, "elapsed_s": round(elapsed, 2),
+                            "N_train": int(len(train_idx)), "N_test": int(len(test_idx)),
+                            "extracts": extracts_dir.name, **metrics}
                     metrics_seeds.append(metrics)
                     rows.append(rec)
                     log_f.write(json.dumps(rec) + "\n"); log_f.flush()
@@ -334,3 +423,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
