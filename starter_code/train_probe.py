@@ -87,8 +87,10 @@ class LinearMultiLayerProbe(nn.Module):
         self.fc = nn.Linear(d * n_layers, 1)
     def forward(self, x_final, x_full, mask):
         # x_full expected to be (B, n_layers, N, d)
+        # Use only last token per layer to avoid padding issues
         B, nL, N, d = x_full.shape
-        x = x_full.reshape(B, nL * d)
+        last = x_full[:, :, -1, :]  # (B, n_layers, d)
+        x = last.reshape(B, nL * d)
         return self.fc(x).squeeze(-1)
 
 
@@ -102,7 +104,8 @@ class MLPMultiLayerProbe(nn.Module):
             nn.Linear(hidden, 1))
     def forward(self, x_final, x_full, mask):
         B, nL, N, d = x_full.shape
-        x = x_full.reshape(B, nL * d)
+        last = x_full[:, :, -1, :]  # (B, n_layers, d)
+        x = last.reshape(B, nL * d)
         return self.net(x).squeeze(-1)
 
 
@@ -151,9 +154,9 @@ def get_full_tokens(ex):
     """
     if "residuals" in ex:
         r = ex["residuals"]
-        # If multi-layer, default to first selected layer (match extract_config "middle")
+        # If multi-layer, return all layers for multi-layer probes
         if r.dim() == 3 and r.shape[0] > 1:
-            return r[0]   # (N, d)
+            return r      # (n_layers, N, d)
         return r.squeeze(0) if r.dim() == 3 else r
     if "middle_layer_all_tokens" in ex:
         return ex["middle_layer_all_tokens"]
@@ -174,7 +177,10 @@ def build_dataset(samples, label_fn, extracts_dir):
         if not m.any():
             skipped += 1; continue
         last = int(m.nonzero().max().item())
-        x_final.append(full[last])
+        if full.dim() == 3 and full.shape[0] > 1:
+            x_final.append(full[0, last])  # first layer, last token
+        else:
+            x_final.append(full[last])
         x_full_list.append(full)
         mask_list.append(m)
         y.append(label_fn(s))
@@ -223,6 +229,17 @@ def pad_multi_layer(x_multi_layer_list):
     return px
 
 
+def pad_multi_layer_last(x_multi_layer_list):
+    """For probes that only use last token - output (N, n_layers, 1, d)."""
+    N = len(x_multi_layer_list)
+    nL = x_multi_layer_list[0].shape[0]
+    d = x_multi_layer_list[0].shape[2]
+    px = torch.zeros(N, nL, 1, d, dtype=DTYPE, device=DEVICE)
+    for i, t in enumerate(x_multi_layer_list):
+        px[i, :, 0, :] = t[:, -1, :]  # last token per layer, shape (nL, d)
+    return px
+
+
 # ---------------- training ----------------
 def train(arch, regime, ds, train_idx, test_idx, seed, d):
     torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
@@ -246,12 +263,18 @@ def train(arch, regime, ds, train_idx, test_idx, seed, d):
                 if arch in ("linear", "mlp"):
                     logits = model(ds["x_final"][bi])
                 elif arch in ("linear_ml", "mlp_ml", "layer_attn"):
-                    px = pad_multi_layer([ds["x_multi_layer_list"][i] for i in bi])
+                    px = pad_multi_layer_last([ds["x_multi_layer_list"][i] for i in bi])
                     out = model(None, px, None)
                     logits = out[0] if isinstance(out, tuple) else out
                 else:
-                    px, pm = pad_full([ds["x_full_list"][i] for i in bi],
-                                        [ds["mask_list"][i] for i in bi])
+                    # attention probes need 2D: use first layer if multi-layer
+                    px_list = []
+                    for i in bi:
+                        t = ds["x_full_list"][i]
+                        if t.dim() == 3 and t.shape[0] > 1:
+                            t = t[0]  # first layer only for attention
+                        px_list.append(t)
+                    px, pm = pad_full(px_list, [ds["mask_list"][i] for i in bi])
                     out = model(None, px, pm)
                     logits = out[0] if isinstance(out, tuple) else out
                 loss = bce(logits, yb)
@@ -271,16 +294,19 @@ def train(arch, regime, ds, train_idx, test_idx, seed, d):
             if arch in ("linear", "mlp"):
                 logits = model(ds["x_final"][idx:idx+1])
             elif arch in ("linear_ml", "mlp_ml", "layer_attn"):
-                px = pad_multi_layer([ds["x_multi_layer_list"][idx]])
+                px = pad_multi_layer_last([ds["x_multi_layer_list"][idx]])
                 out = model(None, px, None)
                 logits = out[0] if isinstance(out, tuple) else out
             else:
-                px, pm = pad_full([ds["x_full_list"][idx]], [ds["mask_list"][idx]])
+                t = ds["x_full_list"][idx]
+                if t.dim() == 3 and t.shape[0] > 1:
+                    t = t[0]
+                px, pm = pad_full([t], [ds["mask_list"][idx]])
                 out = model(None, px, pm)
                 logits = out[0] if isinstance(out, tuple) else out
             loss = bce(logits, yb)
             opt.zero_grad(); loss.backward(); opt.step()
-        best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        best_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
 
     if best_state: model.load_state_dict(best_state)
     return evaluate(model, arch, ds, test_idx), model
@@ -292,11 +318,18 @@ def evaluate(model, arch, ds, idx):
         if arch in ("linear", "mlp"):
             logits = model(ds["x_final"][idx])
         elif arch in ("linear_ml", "mlp_ml", "layer_attn"):
-            px = pad_multi_layer([ds["x_multi_layer_list"][i] for i in idx])
+            px = pad_multi_layer_last([ds["x_multi_layer_list"][i] for i in idx])
             out = model(None, px, None)
             logits = out[0] if isinstance(out, tuple) else out
         else:
-            px, pm = pad_full([ds["x_full_list"][i] for i in idx], [ds["mask_list"][i] for i in idx])
+            # attention probes need 2D: use first layer if multi-layer
+            px_list = []
+            for i in idx:
+                t = ds["x_full_list"][i]
+                if t.dim() == 3 and t.shape[0] > 1:
+                    t = t[0]
+                px_list.append(t)
+            px, pm = pad_full(px_list, [ds["mask_list"][i] for i in idx])
             out = model(None, px, pm)
             logits = out[0] if isinstance(out, tuple) else out
         y = ds["y"][idx]
