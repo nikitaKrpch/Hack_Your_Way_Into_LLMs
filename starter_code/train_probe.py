@@ -414,8 +414,10 @@ def main():
         train_idx = np.concatenate([pos_idx[n_pt:], neg_idx[n_nt:]])
         print(f"  d={d} N={N} train={len(train_idx)} test={len(test_idx)} extracts={extracts_dir.name}")
 
-        best_attn_state = None  # save for dashboard
+        best_attn_state = None
         best_attn_auc = -1
+        best_layer_attn_state = None
+        best_layer_attn_auc = -1
         for arch in ARCHS:
             for reg in REGIMES:
                 metrics_seeds = []
@@ -430,24 +432,35 @@ def main():
                     metrics_seeds.append(metrics)
                     rows.append(rec)
                     log_f.write(json.dumps(rec) + "\n"); log_f.flush()
-                    # Save best attention probe (single-head, batch) per task for dashboard
                     if arch == "attention" and reg == "batch" and metrics["auc"] > best_attn_auc:
                         best_attn_auc = metrics["auc"]
                         best_attn_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+                    if arch == "layer_attn" and reg == "batch" and metrics["auc"] > best_layer_attn_auc:
+                        best_layer_attn_auc = metrics["auc"]
+                        best_layer_attn_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
                 accs = [m["acc"] for m in metrics_seeds]
                 aucs = [m["auc"] for m in metrics_seeds if not math.isnan(m["auc"])]
                 print(f"    {arch:13s} | {reg:11s} | acc {np.mean(accs):.3f}±{np.std(accs):.3f} | auc {(np.mean(aucs) if aucs else float('nan')):.3f}±{(np.std(aucs) if aucs else float('nan')):.3f}")
-        # Save attention probe weights
         if best_attn_state is not None:
             torch.save({
                 "state": best_attn_state,
-                "task": task_name, "model_key": model_key,
+                "task": task_name, "model_key": model_key, "arch": "attention",
                 "extracts_dir": extracts_dir.name,
                 "test_idx": test_idx.tolist(),
                 "train_idx": train_idx.tolist(),
                 "d_model": d,
                 "best_auc_seed_max": best_attn_auc,
             }, str(weights_dir / f"{task_name}_attention.pt"))
+        if best_layer_attn_state is not None:
+            torch.save({
+                "state": best_layer_attn_state,
+                "task": task_name, "model_key": model_key, "arch": "layer_attn",
+                "extracts_dir": extracts_dir.name,
+                "test_idx": test_idx.tolist(),
+                "train_idx": train_idx.tolist(),
+                "d_model": d,
+                "best_auc_seed_max": best_layer_attn_auc,
+            }, str(weights_dir / f"{task_name}_layer_attn.pt"))
 
     log_f.close()
     print(f"\nFull metrics: {log_path}")
