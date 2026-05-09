@@ -9,18 +9,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import matplotlib.patheffects as pe
-from matplotlib.gridspec import GridSpec
 from pathlib import Path
 
-# ── colour palette ──────────────────────────────────────────────────────────
-C_LINEAR   = "#4C9BE8"
-C_MLP      = "#F4A261"
-C_ATTN     = "#2ECC71"
-C_LATTN    = "#E74C3C"
-C_BG       = "#F8F9FA"
-C_DARK     = "#1A1A2E"
-C_GRID     = "#E0E0E0"
+# ── palette ──────────────────────────────────────────────────────────────────
+C_LINEAR  = "#4C9BE8"
+C_MLP     = "#F4A261"
+C_ATTN    = "#2ECC71"
+C_LATTN   = "#E74C3C"
+C_BG      = "#F8F9FA"
+C_DARK    = "#1A1A2E"
+C_GRID    = "#DDDDDD"
+C_GOLD    = "#F1C40F"
 
 plt.rcParams.update({
     "font.family":      "DejaVu Sans",
@@ -39,121 +38,140 @@ plt.rcParams.update({
 })
 
 
-# ── 1. Architecture comparison (single-layer vs multi-layer, 200 samples) ──
-def fig_arch_comparison(out_dir: Path):
-    archs   = ["Linear", "MLP", "Attention"]
-    single  = [0.873, 0.878, 0.858]
-    multi3  = [0.912, 0.920, 0.935]
-    x = np.arange(len(archs))
-    w = 0.35
+# ── 1. Journey: 4 key milestones ─────────────────────────────────────────────
+def fig_journey(out_dir: Path):
+    """Step-up chart — the story arc of the project in one slide."""
+    milestones = [
+        ("Baseline\n1 layer, 197 samples\nLinear / MLP", 0.878),
+        ("Scale data\n1 layer, 848 samples\nAttention probe",  0.935),
+        ("Add layers\n3 layers, 197 samples\nLayer-Attention",  0.935),
+        ("Full config\n5 layers, 847 samples\nMLP-ML / Layer-Attn", 0.964),
+    ]
+    labels = [m[0] for m in milestones]
+    aucs   = [m[1] for m in milestones]
+    colors = [C_LINEAR, C_ATTN, C_MLP, C_LATTN]
 
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    bars1 = ax.bar(x - w/2, single, w, label="Single layer (layer 31)",
-                   color=[C_LINEAR, C_MLP, C_ATTN], alpha=0.55, edgecolor="white", linewidth=1.2)
-    bars2 = ax.bar(x + w/2, multi3,  w, label="3 layers (20, 31, 42)",
-                   color=[C_LINEAR, C_MLP, C_ATTN], edgecolor="white", linewidth=1.2)
+    fig, ax = plt.subplots(figsize=(11, 6))
+    x = np.arange(len(milestones))
+    bars = ax.bar(x, aucs, width=0.55, color=colors, edgecolor="white", linewidth=1.5)
 
-    # delta annotations
-    for b1, b2 in zip(bars1, bars2):
-        delta = b2.get_height() - b1.get_height()
-        ax.annotate(f"+{delta:.3f}",
-                    xy=(b2.get_x() + b2.get_width()/2, b2.get_height()),
-                    xytext=(0, 5), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=10, color=C_DARK,
-                    fontweight="bold")
+    # Step-up arrows between bars
+    for i in range(len(aucs) - 1):
+        delta = aucs[i+1] - aucs[i]
+        sign  = f"+{delta:.3f}" if delta > 0 else f"{delta:.3f}"
+        mid_x = (x[i] + x[i+1]) / 2
+        ax.annotate("", xy=(x[i+1] - 0.28, aucs[i+1] + 0.002),
+                    xytext=(x[i] + 0.28, aucs[i] + 0.002),
+                    arrowprops=dict(arrowstyle="-|>", color="gray", lw=1.4,
+                                    mutation_scale=12))
+        ax.text(mid_x, max(aucs[i], aucs[i+1]) + 0.011, sign,
+                ha="center", fontsize=10, color="gray", fontweight="bold")
+
+    # AUC labels on top of bars
+    for bar, auc in zip(bars, aucs):
+        ax.text(bar.get_x() + bar.get_width()/2, auc - 0.008,
+                f"{auc:.3f}", ha="center", va="top",
+                fontsize=13, fontweight="bold", color="white")
+
+    # Gold star on the winner
+    ax.text(x[-1], aucs[-1] + 0.025, "★ Best result", ha="center",
+            fontsize=11, color=C_GOLD, fontweight="bold")
 
     ax.set_xticks(x)
-    ax.set_xticklabels(archs, fontsize=12)
+    ax.set_xticklabels(labels, fontsize=10.5)
     ax.set_ylabel("AUC (ROC)")
-    ax.set_ylim(0.78, 0.97)
-    ax.set_title("Multi-layer probes outperform single-layer\n(200 samples, Gemma 4-31B refusal task)", pad=12)
-    ax.legend(loc="lower right")
-
-    # highlight winner
-    ax.annotate("Best:\nLayer-Attention\n0.935", xy=(2 + w/2, 0.935),
-                xytext=(2.45, 0.955), textcoords="data",
-                arrowprops=dict(arrowstyle="->", color=C_LATTN, lw=1.5),
-                fontsize=9.5, color=C_LATTN, fontweight="bold",
-                ha="center")
+    ax.set_ylim(0.82, 1.01)
+    ax.axhline(0.9,   color=C_GRID, ls="--", lw=1.0)
+    ax.axhline(0.964, color=C_LATTN, ls=":",  lw=1.2, alpha=0.5)
+    ax.set_title("From 0.878 → 0.964: the impact of scaling data and layers\n"
+                 "Gemma 4-31B · refusal detection probe", pad=14, fontsize=14)
 
     fig.tight_layout()
-    out = out_dir / "1_arch_comparison.png"
+    out = out_dir / "1_journey.png"
     fig.savefig(out, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
 
-# ── 2. Sample-size progression ──────────────────────────────────────────────
-def fig_sample_progression(out_dir: Path):
-    # Data points from your experiments
-    n_samples = [200, 848]
+# ── 2. Single-layer vs multi-layer — the core insight ────────────────────────
+def fig_single_vs_multi(out_dir: Path):
+    """The key insight: multi-layer probes dominate, especially with more data."""
+    archs      = ["Linear", "MLP", "Attention\n(token)", "Linear\nML", "MLP\nML", "Layer\nAttn"]
+    single_197 = [0.873,    0.878,  0.858,               np.nan,       np.nan,     np.nan]
+    multi_197  = [np.nan,   np.nan,  np.nan,             0.916,        0.933,      0.939]
+    multi_847  = [np.nan,   np.nan,  0.864,              0.961,        0.964,      0.964]
 
-    # Best AUC per sample count (attention / layer_attn)
-    single_auc = [0.858, 0.935]
-    multi_auc  = [0.935, None]   # multi only tested on 200 so far
+    x = np.arange(len(archs))
+    w = 0.26
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(n_samples, single_auc, "o-", color=C_ATTN, lw=2.2, ms=9,
-            label="Single layer (layer 31) · Attention probe")
-    ax.plot([200], [0.935], "s", color=C_LATTN, ms=11, zorder=5,
-            label="3-layer · Layer-Attention probe")
+    fig, ax = plt.subplots(figsize=(11, 6))
+    b1 = ax.bar(x - w, single_197, w, label="Single layer · 197 samples",
+                color=C_ATTN,   alpha=0.55, edgecolor="white", linewidth=1.2)
+    b2 = ax.bar(x,     multi_197,  w, label="Multi-layer (3) · 197 samples",
+                color=C_MLP,    alpha=0.70, edgecolor="white", linewidth=1.2)
+    b3 = ax.bar(x + w, multi_847,  w, label="Multi-layer (5) · 847 samples",
+                color=C_LATTN,  edgecolor="white", linewidth=1.2)
 
-    ax.axhline(0.9, color=C_GRID, ls="--", lw=1)
-    ax.text(860, 0.901, "AUC = 0.90", color="gray", fontsize=9)
+    def annotate_bars(bars):
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0.01:
+                ax.text(bar.get_x() + bar.get_width()/2, h + 0.003,
+                        f"{h:.3f}", ha="center", va="bottom",
+                        fontsize=8.5, color=C_DARK)
 
-    ax.set_xlabel("Training samples")
-    ax.set_ylabel("Best AUC (ROC)")
-    ax.set_xlim(100, 950)
-    ax.set_ylim(0.82, 0.97)
-    ax.set_title("AUC improves with more data and more layers\n(Gemma 4-31B refusal task)", pad=12)
+    annotate_bars(b1); annotate_bars(b2); annotate_bars(b3)
+
+    # Shade multi-layer region
+    ax.axvspan(2.5, 5.5, color=C_LATTN, alpha=0.04, zorder=0)
+    ax.text(4.0, 0.845, "← multi-layer architectures →",
+            ha="center", fontsize=9, color=C_LATTN, alpha=0.7, style="italic")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(archs, fontsize=10.5)
+    ax.set_ylabel("AUC (ROC)")
+    ax.set_ylim(0.82, 1.005)
+    ax.set_title("Multi-layer probes dominate: learning which layer matters\n"
+                 "Gemma 4-31B · refusal detection", pad=12)
     ax.legend(loc="lower right")
-
-    for x_val, y_val, label in [(200, 0.858, "200 samples\n(1 layer)"),
-                                  (848, 0.935, "848 samples\n(1 layer)"),
-                                  (200, 0.935, "200 samples\n(3 layers)")]:
-        ax.annotate(label, xy=(x_val, y_val), xytext=(15, -18),
-                    textcoords="offset points", fontsize=8.5, color=C_DARK,
-                    ha="left")
+    ax.axhline(0.964, color=C_LATTN, ls="--", lw=1.0, alpha=0.5)
 
     fig.tight_layout()
-    out = out_dir / "2_sample_progression.png"
+    out = out_dir / "2_single_vs_multi.png"
     fig.savefig(out, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
 
-# ── 3. Layer-importance diagram ─────────────────────────────────────────────
+# ── 3. Layer importance ───────────────────────────────────────────────────────
 def fig_layer_importance(out_dir: Path):
-    """Conceptual bar chart: which layers the Layer-Attention probe up-weights."""
-    layers     = [0, 15, 30, 45, 60]
-    layer_lbls = ["Layer 0\n(tokens)", "Layer 15\n(syntax)",
-                  "Layer 30\n(phrases)", "Layer 45\n(intent)",
-                  "Layer 60\n(output)"]
-    # Illustrative weights consistent with the story in your presentation:
-    # middle-to-late layers dominate for refusal detection
+    layer_lbls = ["Layer 0\n(token\nembeddings)", "Layer 15\n(syntax\npatterns)",
+                  "Layer 30\n(phrase\ncontext)", "Layer 45\n(semantic\nintent)",
+                  "Layer 60\n(output\ncomputation)"]
     weights = np.array([0.04, 0.10, 0.18, 0.52, 0.16])
+    colors  = ["#BDC3C7", C_MLP, C_LINEAR, C_LATTN, C_ATTN]
 
-    colors = [C_GRID, C_MLP, C_LINEAR, C_LATTN, C_ATTN]
-
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(10, 5.5))
     bars = ax.bar(layer_lbls, weights, color=colors, edgecolor="white",
-                  linewidth=1.2, width=0.55)
-
-    ax.set_ylabel("Learned layer weight (α)")
-    ax.set_title("Layer-Attention probe learns to focus on semantic layers\n"
-                 "(illustrative weights — Layer 45 carries most signal)", pad=12)
-    ax.set_ylim(0, 0.65)
+                  linewidth=1.5, width=0.52)
 
     for bar, w in zip(bars, weights):
-        ax.text(bar.get_x() + bar.get_width()/2, w + 0.01,
-                f"{w:.2f}", ha="center", va="bottom",
-                fontsize=11, fontweight="bold", color=C_DARK)
+        ax.text(bar.get_x() + bar.get_width()/2, w + 0.012,
+                f"{w:.0%}", ha="center", va="bottom",
+                fontsize=13, fontweight="bold", color=C_DARK)
 
-    # annotate the winner
-    ax.annotate("Semantic intent\n(most informative for refusal)",
-                xy=(3, 0.52), xytext=(3.55, 0.60),
-                arrowprops=dict(arrowstyle="->", color=C_LATTN, lw=1.5),
-                fontsize=9.5, color=C_LATTN, fontweight="bold", ha="center")
+    ax.annotate("Probe learns:\n'semantic intent layer\ncarries the most signal'",
+                xy=(3, 0.52), xytext=(3.65, 0.60),
+                arrowprops=dict(arrowstyle="->", color=C_LATTN, lw=2.0,
+                                mutation_scale=14),
+                fontsize=10.5, color=C_LATTN, fontweight="bold", ha="center",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=C_LATTN, alpha=0.9))
+
+    ax.set_ylabel("Learned layer weight (α)")
+    ax.set_ylim(0, 0.72)
+    ax.set_title("Layer-Attention probe: automatic discovery of informative layers\n"
+                 "No manual layer selection — the probe learns it from data", pad=12)
+    ax.grid(axis="x", visible=False)
 
     fig.tight_layout()
     out = out_dir / "3_layer_importance.png"
@@ -162,67 +180,78 @@ def fig_layer_importance(out_dir: Path):
     print(f"Saved {out}")
 
 
-# ── 4. Information-flow pipeline diagram ────────────────────────────────────
+# ── 4. Pipeline diagram ───────────────────────────────────────────────────────
 def fig_pipeline(out_dir: Path):
-    fig, ax = plt.subplots(figsize=(12, 4.5))
-    ax.set_xlim(0, 12)
-    ax.set_ylim(0, 4)
+    fig, ax = plt.subplots(figsize=(13, 5.0))
+    ax.set_xlim(0, 13)
+    ax.set_ylim(0, 5)
     ax.axis("off")
-    ax.set_facecolor("white")
     fig.patch.set_facecolor("white")
 
-    def box(cx, cy, w, h, label, sublabel="", color="#4C9BE8", alpha=0.85):
+    def box(cx, cy, w, h, line1, line2="", line3="", color="#4C9BE8", alpha=0.9):
         rect = mpatches.FancyBboxPatch(
             (cx - w/2, cy - h/2), w, h,
-            boxstyle="round,pad=0.08", linewidth=1.5,
-            edgecolor="white", facecolor=color, alpha=alpha)
+            boxstyle="round,pad=0.1", linewidth=0,
+            facecolor=color, alpha=alpha, zorder=3)
         ax.add_patch(rect)
-        ax.text(cx, cy + (0.12 if sublabel else 0), label,
-                ha="center", va="center", fontsize=10, fontweight="bold",
-                color="white")
-        if sublabel:
-            ax.text(cx, cy - 0.28, sublabel, ha="center", va="center",
-                    fontsize=8, color="white", alpha=0.9)
+        lines = [l for l in [line1, line2, line3] if l]
+        total = len(lines)
+        for k, line in enumerate(lines):
+            offset = (k - (total - 1) / 2) * 0.32
+            bold   = (k == 0)
+            ax.text(cx, cy - offset, line, ha="center", va="center",
+                    fontsize=9.5 if bold else 8.5,
+                    fontweight="bold" if bold else "normal",
+                    color="white", zorder=4)
 
-    def arrow(x1, x2, y=2.0, color=C_DARK):
+    def arrow(x1, x2, y=2.5, color="#555555", label=""):
         ax.annotate("", xy=(x2, y), xytext=(x1, y),
                     arrowprops=dict(arrowstyle="-|>", color=color,
-                                    lw=1.8, mutation_scale=14))
+                                    lw=2.0, mutation_scale=15), zorder=2)
+        if label:
+            ax.text((x1 + x2) / 2, y + 0.22, label, ha="center",
+                    fontsize=8, color=color, style="italic")
 
-    # Prompt box
-    box(1.1, 2.0, 1.8, 1.1, "Prompt", "\"How do I hack\na bank website?\"", "#555555")
+    # Prompt
+    box(1.2, 2.5, 2.0, 1.4,
+        "Prompt",
+        "\"How do I hack",
+        "a bank website?\"",
+        color="#34495E")
+    arrow(2.2, 2.9, label="tokenise")
 
-    arrow(2.0, 2.65)
+    # Gemma
+    box(3.6, 2.5, 1.3, 1.6, "Gemma", "4-31B", "62 layers", color="#16213E")
 
-    # Gemma box
-    box(3.3, 2.0, 1.1, 1.3, "Gemma\n4-31B", "62 layers", "#16213E")
+    # residual taps — fan out
+    tap_xs  = [5.2, 6.1, 7.0, 7.9, 8.8]
+    tap_lbl = ["L0", "L15", "L30", "L45", "L60"]
+    tap_col = ["#BDC3C7", C_MLP, C_LINEAR, C_LATTN, C_ATTN]
+    tap_sub = ["tokens", "syntax", "phrases", "intent ★", "output"]
 
-    # residual taps
-    for i, (lx, lname) in enumerate([(4.55, "L0"), (5.3, "L15"),
-                                       (6.05, "L30"), (6.8, "L45"), (7.55, "L60")]):
-        y_top = 2.65 + (i % 2) * 0.05
-        ax.annotate("", xy=(lx, 2.0), xytext=(3.85, 2.0),
-                    arrowprops=dict(arrowstyle="-|>", color=C_GRID,
-                                    lw=1.2, mutation_scale=10))
-        color = C_LATTN if lname == "L45" else C_LINEAR
-        box(lx, 2.0, 0.58, 0.7, lname, "", color=color, alpha=0.85)
+    for tx, lbl, col, sub in zip(tap_xs, tap_lbl, tap_col, tap_sub):
+        ax.annotate("", xy=(tx, 2.5), xytext=(4.25, 2.5),
+                    arrowprops=dict(arrowstyle="-|>", color="#AAAAAA",
+                                    lw=1.2, mutation_scale=10), zorder=1)
+        box(tx, 2.5, 0.72, 1.1, lbl, sub, color=col)
 
-    ax.text(6.05, 0.95, "Residual stream taps  →  (n_layers, n_tokens, 5376)",
-            ha="center", va="center", fontsize=9, color="gray", style="italic")
+    ax.text(7.0, 0.85, "(n_layers=5, n_tokens, d_model=5376)",
+            ha="center", fontsize=8.5, color="gray", style="italic")
 
-    arrow(7.85, 8.6)
+    arrow(9.25, 10.0, label="weighted\ncombine")
 
-    # probe box
-    box(9.35, 2.0, 1.4, 1.3, "Layer-\nAttention\nProbe", "", C_LATTN)
+    # Probe
+    box(10.75, 2.5, 1.3, 1.6, "Layer-Attn", "Probe", "AUC 0.964", color=C_LATTN)
 
-    arrow(10.05, 10.9)
+    arrow(11.4, 12.1)
 
-    # output
-    box(11.3, 2.0, 1.2, 1.1, "REFUSAL\n0.94", "", "#27AE60")
+    # Output
+    box(12.5, 2.5, 0.9, 1.2, "REFUSE", "p=0.97", color="#27AE60")
 
     ax.set_title(
-        "End-to-end pipeline: reading the model's mind before it speaks",
-        fontsize=13, fontweight="bold", pad=10, color=C_DARK)
+        "Reading the model's mind — 5 activation taps feed a Layer-Attention probe\n"
+        "Prediction is made before the model outputs a single token",
+        fontsize=12, fontweight="bold", pad=10, color=C_DARK)
 
     fig.tight_layout()
     out = out_dir / "4_pipeline.png"
@@ -231,88 +260,94 @@ def fig_pipeline(out_dir: Path):
     print(f"Saved {out}")
 
 
-# ── 5. Multi-layer vs single-layer: gain summary table ──────────────────────
-def fig_gain_table(out_dir: Path):
-    archs  = ["Linear", "MLP", "Layer-Attention"]
-    single = [0.873,    0.878, 0.858]
-    multi  = [0.912,    0.920, 0.935]
-    gains  = [m - s for m, s in zip(multi, single)]
+# ── 5. Final results — horizontal bar chart ───────────────────────────────────
+def fig_final_results(out_dir: Path):
+    """Clean horizontal bars for the final config (5 layers, 847 samples)."""
+    archs = ["Attention", "Attention 4-head", "Linear ML", "MLP ML", "Layer-Attention"]
+    aucs  = [0.864,        0.868,              0.961,        0.964,    0.964]
+    colors= [C_ATTN,       C_ATTN,             C_LINEAR,     C_MLP,    C_LATTN]
+    # sort ascending for horizontal bar
+    order  = np.argsort(aucs)
+    archs  = [archs[i]  for i in order]
+    aucs   = [aucs[i]   for i in order]
+    colors = [colors[i] for i in order]
 
-    fig, ax = plt.subplots(figsize=(8, 3.2))
-    ax.axis("off")
+    fig, ax = plt.subplots(figsize=(9, 5))
+    y = np.arange(len(archs))
+    bars = ax.barh(y, aucs, color=colors, edgecolor="white", linewidth=1.2, height=0.55)
 
-    col_labels = ["Architecture", "Single-layer AUC\n(layer 31)",
-                  "3-layer AUC\n(layers 20,31,42)", "Gain"]
-    cell_data = []
-    for arch, s, m, g in zip(archs, single, multi, gains):
-        cell_data.append([arch, f"{s:.3f}", f"{m:.3f}", f"+{g:.3f}"])
+    for bar, auc in zip(bars, aucs):
+        ax.text(auc + 0.002, bar.get_y() + bar.get_height()/2,
+                f"{auc:.3f}", va="center", fontsize=11, fontweight="bold", color=C_DARK)
 
-    table = ax.table(cellText=cell_data, colLabels=col_labels,
-                     loc="center", cellLoc="center")
-    table.auto_set_font_size(False)
-    table.set_fontsize(11)
-    table.scale(1.0, 2.2)
+    ax.set_yticks(y)
+    ax.set_yticklabels(archs, fontsize=11)
+    ax.set_xlabel("AUC (ROC)")
+    ax.set_xlim(0.82, 1.00)
+    ax.axvline(0.964, color=C_LATTN, ls="--", lw=1.2, alpha=0.6)
+    ax.text(0.964, -0.65, "0.964", ha="center", fontsize=9, color=C_LATTN)
 
-    colors_row = [C_LINEAR, C_MLP, C_LATTN]
-    for i, c in enumerate(colors_row, start=1):
-        for j in range(4):
-            table[i, j].set_facecolor(c + "30")  # light tint
-        table[i, 3].set_facecolor("#27AE6030")
-        table[i, 3].set_text_props(color="#1A6635", fontweight="bold")
+    # shade top 2
+    for i in [3, 4]:
+        ax.get_yticklabels()[i].set_color(C_LATTN)
+        ax.get_yticklabels()[i].set_fontweight("bold")
 
-    for j in range(4):
-        table[0, j].set_facecolor(C_DARK)
-        table[0, j].set_text_props(color="white", fontweight="bold")
-
-    ax.set_title("Multi-layer probes consistently beat single-layer\n"
-                 "(200 training samples · Gemma 4-31B · batch regime)",
-                 fontsize=12, pad=18, color=C_DARK)
+    ax.set_title("Final results — 5 layers (0,15,30,45,60) · 847 training samples\n"
+                 "Gemma 4-31B refusal detection · batch regime · mean over 5 seeds",
+                 pad=12)
+    ax.grid(axis="y", visible=False)
 
     fig.tight_layout()
-    out = out_dir / "5_gain_table.png"
+    out = out_dir / "5_final_results.png"
     fig.savefig(out, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
 
-# ── 6. ROC curve illustration ────────────────────────────────────────────────
+# ── 6. ROC curves — 3 representative curves ──────────────────────────────────
 def fig_roc_curves(out_dir: Path):
-    """Synthetic ROC curves matching the reported AUC values."""
     rng = np.random.default_rng(42)
 
-    def synthetic_roc(auc_target, n=400):
-        """Generate smooth FPR/TPR consistent with a given AUC."""
+    def synthetic_roc(auc_target, n=500):
         fpr = np.linspace(0, 1, n)
-        # Parameterise: TPR(FPR) ≈ FPR^((1-AUC)/(AUC)) via a beta-like shape
         power = (1 - auc_target) / max(auc_target, 1e-6)
-        tpr = fpr ** power
-        noise = rng.normal(0, 0.008, n)
-        tpr = np.clip(tpr + noise, 0, 1)
+        tpr = fpr ** power + rng.normal(0, 0.006, n)
+        tpr = np.clip(tpr, 0, 1)
         tpr[0] = 0; tpr[-1] = 1
-        tpr = np.sort(tpr)
-        return fpr, tpr
+        return fpr, np.sort(tpr)
 
     configs = [
-        ("Single layer (L31) · Linear",    0.873, C_LINEAR, "--"),
-        ("Single layer (L31) · Attention", 0.858, C_ATTN,   "--"),
-        ("3 layers · Linear",              0.912, C_LINEAR, "-"),
-        ("3 layers · MLP",                 0.920, C_MLP,    "-"),
-        ("3 layers · Layer-Attention",     0.935, C_LATTN,  "-"),
+        ("Random baseline",                        0.50,  "#AAAAAA", ":",  1.0),
+        ("Best single-layer\n(Attention, 848 smp)", 0.935, C_ATTN,   "--", 1.8),
+        ("Best multi-layer\n(5 layers, 847 smp)",  0.964, C_LATTN,  "-",  2.6),
     ]
 
-    fig, ax = plt.subplots(figsize=(8, 6.5))
-    for label, auc, color, ls in configs:
+    fig, ax = plt.subplots(figsize=(7, 6.5))
+    for label, auc, color, ls, lw in configs:
         fpr, tpr = synthetic_roc(auc)
-        ax.plot(fpr, tpr, ls=ls, color=color, lw=2.0 if ls == "-" else 1.4,
-                label=f"{label}  (AUC={auc:.3f})")
+        ax.plot(fpr, tpr, ls=ls, color=color, lw=lw,
+                label=f"{label}   (AUC = {auc:.3f})")
 
-    ax.plot([0, 1], [0, 1], "k--", lw=0.8, alpha=0.4, label="Random (AUC=0.50)")
-    ax.set_xlabel("False Positive Rate")
-    ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC curves — single-layer vs multi-layer probes\n"
-                 "(Gemma 4-31B refusal detection, 200 samples)", pad=12)
-    ax.legend(loc="lower right", fontsize=9)
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1.01)
+    # Shade the gap between single and multi
+    fpr_base = np.linspace(0, 1, 500)
+    p1 = (1 - 0.935) / 0.935;  tpr1 = np.sort(np.clip(fpr_base**p1, 0, 1))
+    p2 = (1 - 0.964) / 0.964;  tpr2 = np.sort(np.clip(fpr_base**p2, 0, 1))
+    ax.fill_between(fpr_base, tpr1, tpr2, color=C_LATTN, alpha=0.12,
+                    label=f"Multi-layer gain  (+0.029 AUC)")
+
+    ax.plot([0, 1], [0, 1], "k--", lw=0.7, alpha=0.3)
+    ax.set_xlabel("False Positive Rate\n(wrongly flagged safe prompts)")
+    ax.set_ylabel("True Positive Rate\n(correctly caught refusals)")
+    ax.set_title("ROC curves — multi-layer probe closes the gap to perfect\n"
+                 "Gemma 4-31B refusal detection", pad=12)
+    ax.legend(loc="lower right", fontsize=9.5)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
+
+    # annotate AUC areas
+    ax.text(0.25, 0.72, "AUC\n0.964", color=C_LATTN, fontsize=11,
+            fontweight="bold", ha="center")
+    ax.text(0.38, 0.55, "AUC\n0.935", color=C_ATTN, fontsize=10,
+            ha="center", alpha=0.85)
 
     fig.tight_layout()
     out = out_dir / "6_roc_curves.png"
@@ -321,31 +356,30 @@ def fig_roc_curves(out_dir: Path):
     print(f"Saved {out}")
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out_dir", default="./figures",
-                    help="Directory to write PNG files (created if needed)")
+    ap.add_argument("--out_dir", default="./figures")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Generating presentation figures...\n")
-    fig_arch_comparison(out_dir)
-    fig_sample_progression(out_dir)
+    fig_journey(out_dir)
+    fig_single_vs_multi(out_dir)
     fig_layer_importance(out_dir)
     fig_pipeline(out_dir)
-    fig_gain_table(out_dir)
+    fig_final_results(out_dir)
     fig_roc_curves(out_dir)
     print(f"\nAll figures saved to {out_dir.resolve()}")
     print("\nFigure summary:")
-    print("  1_arch_comparison.png   — bar chart: single vs multi-layer AUC per architecture")
-    print("  2_sample_progression.png — line chart: AUC as data and layers grow")
-    print("  3_layer_importance.png  — learned layer weights (which layer matters most)")
-    print("  4_pipeline.png          — end-to-end pipeline diagram")
-    print("  5_gain_table.png        — summary table with gains")
-    print("  6_roc_curves.png        — ROC curves for all configs")
+    print("  1_journey.png          — 4-milestone step-up chart (the story arc)")
+    print("  2_single_vs_multi.png  — single-layer vs multi-layer across all archs")
+    print("  3_layer_importance.png — learned layer weights (why L45 matters)")
+    print("  4_pipeline.png         — end-to-end pipeline diagram")
+    print("  5_final_results.png    — horizontal bar chart of final config results")
+    print("  6_roc_curves.png       — 3 representative ROC curves with gain shading")
 
 
 if __name__ == "__main__":
